@@ -16,6 +16,17 @@
           "index",
           "quickstart"
         ]
+      },
+      {
+        "group": "Request pipeline",
+        "pages": [
+          "request-pipeline/overview",
+          "request-pipeline/middleware",
+          "request-pipeline/guards",
+          "request-pipeline/interceptors",
+          "request-pipeline/pipes",
+          "request-pipeline/exception-filters"
+        ]
       }
     ],
     "global": {

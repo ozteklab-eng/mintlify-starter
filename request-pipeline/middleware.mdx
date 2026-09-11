@@ -1,0 +1,76 @@
+---
+title: "Middleware"
+description: "Adapter-level handlers that run at the router layer before guards, interceptors, pipes, and the route handler."
+---
+
+Middleware runs at the HTTP adapter's router layer, before Nest builds the execution context. Use it for behavior that needs to look at raw requests independently of any controller: request logging, correlation IDs, cookie parsing, security headers.
+
+## When to use middleware vs. an interceptor
+
+- Reach for **middleware** when the logic is adapter-native (Express or Fastify plugins) or when you need to match by URL path and method without tying to a controller.
+- Reach for an [interceptor](/request-pipeline/interceptors) when you need the `ExecutionContext`, the controller instance, the handler reference, or an RxJS stream over the response.
+
+Middleware has no access to `ExecutionContext` and cannot see the controller class or method it precedes.
+
+## Writing middleware
+
+Middleware is a class implementing `NestMiddleware`, or a function with the signature `(req, res, next) => void`.
+
+```ts
+import { Injectable, NestMiddleware } from '@nestjs/common';
+
+@Injectable()
+export class LoggerMiddleware implements NestMiddleware {
+  use(req: any, res: any, next: () => void) {
+    console.log(`${req.method} ${req.url}`);
+    next();
+  }
+}
+```
+
+## Registering middleware
+
+Register middleware in a module via `configure(consumer)` and the `MiddlewareConsumer` builder:
+
+```ts
+import { MiddlewareConsumer, Module, NestModule, RequestMethod } from '@nestjs/common';
+import { LoggerMiddleware } from './logger.middleware';
+
+@Module({ /* ... */ })
+export class AppModule implements NestModule {
+  configure(consumer: MiddlewareConsumer) {
+    consumer
+      .apply(LoggerMiddleware)
+      .exclude({ path: 'health', method: RequestMethod.GET })
+      .forRoutes({ path: 'users/*', method: RequestMethod.ALL });
+  }
+}
+```
+
+## How the pipeline registers it
+
+`MiddlewareModule` (in `packages/core/middleware/middleware-module.ts`) walks each module's `configure()` calls, resolves each middleware instance, and registers a handler with the HTTP adapter through `registerHandler()`. That method calls `applicationRef.createMiddlewareFactory(method)` to get the adapter's router-level registration function, then either forwards the request to the middleware proxy or short-circuits based on the request method:
+
+```ts
+const middlewareFunction = isMethodAll
+  ? proxy
+  : (req, res, next) => {
+      const actualRequestMethod = applicationRef.getRequestMethod?.(req);
+      if (
+        actualRequestMethod === requestMethod ||
+        (actualRequestMethod === 'HEAD' && requestMethod === 'GET')
+      ) {
+        return proxy(req, res, next);
+      }
+      return next();
+    };
+```
+
+Two things follow from this:
+
+- A middleware bound to `RequestMethod.GET` also runs for `HEAD` requests to the same path.
+- The proxy itself is created by `RouterProxy.createProxy()`, so any throw from a middleware is caught and forwarded to `ExceptionsHandler.next()`, the same handler that catches errors from controllers.
+
+## Execution order
+
+Middleware runs before guards. Inside the middleware layer itself, the order matches the order of `consumer.apply(...)` calls, module by module, in the order `MiddlewareModule.registerMiddleware()` iterates modules.
