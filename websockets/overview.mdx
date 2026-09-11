@@ -1,0 +1,179 @@
+---
+title: "WebSockets"
+description: "Build real-time, bidirectional, event-based applications with gateways and platform adapters"
+---
+
+The WebSockets subsystem lets you build real-time, event-based endpoints alongside your HTTP controllers. You define **gateways** with decorators, and the framework wires them up through a platform-specific **adapter** at bootstrap. Two adapters ship out of the box: one for Socket.IO and one for the [`ws`](https://github.com/websockets/ws) library.
+
+Use this subsystem when you need push-based communication with clients: chat, live dashboards, notifications, collaborative editing, or any workload where request/response HTTP does not fit.
+
+## How it fits together
+
+Gateways look and behave like controllers, but they subscribe to messages on a WebSocket connection instead of matching HTTP routes. At bootstrap:
+
+1. The `SocketModule` registers with the Nest container and picks an adapter. If you have not called `app.useWebSocketAdapter(...)`, it lazy-loads `@nestjs/platform-socket.io` and installs `IoAdapter` by default.
+2. The `WebSocketsController` walks every provider in every module, keeps the ones whose metatype is decorated with `@WebSocketGateway()`, and asks the `GatewayMetadataExplorer` to enumerate their message handlers and server-property injection points.
+3. The `SocketsContainer` de-duplicates servers by gateway options. Gateways that share the same port and options share the same underlying server instance.
+4. For each unique server, the adapter is called to create the server, bind connection and disconnect events, and register per-message handlers.
+
+## Defining a gateway
+
+Decorate a provider with `@WebSocketGateway()` and give it one or more `@SubscribeMessage()` handlers.
+
+```typescript
+import {
+  WebSocketGateway,
+  WebSocketServer,
+  SubscribeMessage,
+  MessageBody,
+  ConnectedSocket,
+} from '@nestjs/websockets';
+import { Server, Socket } from 'socket.io';
+
+@WebSocketGateway(8080, { namespace: 'chat', cors: { origin: '*' } })
+export class ChatGateway {
+  @WebSocketServer()
+  server: Server;
+
+  @SubscribeMessage('message')
+  handleMessage(
+    @MessageBody() payload: { room: string; text: string },
+    @ConnectedSocket() client: Socket,
+  ) {
+    this.server.to(payload.room).emit('message', payload.text);
+    return { status: 'delivered' };
+  }
+}
+```
+
+Gateways are providers. Register them in a module's `providers` array like any other injectable. They participate in dependency injection, so you can inject services, repositories, and configuration.
+
+## Decorators
+
+All decorators are exported from `@nestjs/websockets`.
+
+### `@WebSocketGateway(port?, options?)`
+
+Marks a class as a gateway. Accepts three call shapes:
+
+- `@WebSocketGateway()` — bind to the default port (`0`, meaning the underlying HTTP server).
+- `@WebSocketGateway(port)` — bind to a specific numeric port.
+- `@WebSocketGateway(port?, options)` — set gateway options such as `namespace`, `cors`, `path`, or `transports`. When `port` is omitted, pass options as the first argument.
+
+The framework hashes the options object to decide which gateways share a server, so gateways with identical options reuse the same server instance.
+
+### `@SubscribeMessage(event)`
+
+Marks a method as a handler for an incoming event name. The event value can be any type your adapter supports as a message pattern (a string by default).
+
+### `@WebSocketServer()`
+
+Property decorator that assigns the native server instance (for example, a `socket.io` `Server` or a `ws` `WebSocket.Server`) to the decorated property after the server is created.
+
+### `@MessageBody(propertyOrPipes?, ...pipes)`
+
+Parameter decorator that extracts the message payload.
+
+- `@MessageBody()` — the full payload.
+- `@MessageBody('data')` — a single property from the payload.
+- `@MessageBody(new ValidationPipe())` — the full payload, transformed by one or more pipes.
+- `@MessageBody('data', { schema: z.string() })` — a single property with additional options such as a schema.
+
+### `@ConnectedSocket()`
+
+Parameter decorator that injects the underlying client socket into the handler.
+
+### `@Ack()`
+
+Parameter decorator that injects the acknowledgement callback (when the transport provides one). Using `@Ack()` tells the framework you will call the callback yourself, so it will not send an automatic ack based on your return value.
+
+```typescript
+@SubscribeMessage('events')
+onEvent(
+  @MessageBody() data: string,
+  @Ack() ack: (response: any) => void,
+) {
+  ack({ status: 'ok' });
+}
+```
+
+Return values from handlers are handled automatically otherwise: strings, objects, `Promise`s, and `Observable`s are all supported. Objects of the shape `{ event, data }` are re-emitted as a new event; anything else is passed to the ack callback when the transport provides one.
+
+## Choosing an adapter
+
+Pick an adapter in `main.ts` before `app.listen(...)`. If you skip this step the framework installs `IoAdapter` for you on first gateway connection.
+
+### Socket.IO — `IoAdapter`
+
+Ships in `@nestjs/platform-socket.io`. Use this when you want the full Socket.IO feature set: namespaces, rooms, automatic reconnection, fallback transports, and broad browser client support.
+
+```typescript
+import { NestFactory } from '@nestjs/core';
+import { IoAdapter } from '@nestjs/platform-socket.io';
+import { AppModule } from './app.module';
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+  app.useWebSocketAdapter(new IoAdapter(app));
+  await app.listen(3000);
+}
+bootstrap();
+```
+
+`IoAdapter.create(port, options)` accepts standard `ServerOptions`, plus `namespace` and an existing `server` instance. When `port` is `0` and an HTTP server exists, Socket.IO attaches to that HTTP server instead of opening a new port.
+
+### Raw WebSocket — `WsAdapter`
+
+Ships in `@nestjs/platform-ws`. Use this when you want a lightweight, standards-based WebSocket server with no protocol layer on top.
+
+```typescript
+import { NestFactory } from '@nestjs/core';
+import { WsAdapter } from '@nestjs/platform-ws';
+import { AppModule } from './app.module';
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+  app.useWebSocketAdapter(new WsAdapter(app));
+  await app.listen(3000);
+}
+bootstrap();
+```
+
+`WsAdapter` expects each incoming frame to be a JSON object of the shape `{ event: string, data: unknown }`. Override this with a custom parser:
+
+```typescript
+new WsAdapter(app, {
+  messageParser: (data) => {
+    // return { event, data } or nothing to ignore the frame
+    return JSON.parse(data.toString());
+  },
+});
+```
+
+The adapter also handles HTTP upgrade routing when multiple WebSocket servers share one HTTP server on different paths.
+
+### Custom adapters
+
+Subclass `AbstractWsAdapter` (from `@nestjs/websockets`) to integrate any other WebSocket library. You must implement `create(port, options)` and `bindMessageHandlers(client, handlers, transform)`. `AbstractWsAdapter` already implements `bindClientConnect`, `bindClientDisconnect`, `close`, and `dispose` against the `on(event, callback)` / `close()` interface.
+
+## Lifecycle hooks
+
+Gateways can implement any of the following interfaces to react to the connection lifecycle:
+
+- `OnGatewayInit` — `afterInit(server)` runs once, right after the adapter creates the server.
+- `OnGatewayConnection` — `handleConnection(client, ...args)` runs on every new connection.
+- `OnGatewayDisconnect` — `handleDisconnect(client)` runs when a client disconnects.
+
+These hooks are wired by `WebSocketsController` during `connectGatewayToServer`.
+
+## Pipes, guards, interceptors, and filters
+
+The WebSockets subsystem shares the request pipeline with HTTP controllers. `SocketModule` builds a `WsContextCreator` at register time with the same `PipesContextCreator`, `GuardsContextCreator`, `InterceptorsContextCreator`, and exception filters used elsewhere. That means:
+
+- Global pipes, guards, interceptors, and filters registered via `app.useGlobalX(...)` apply to `@SubscribeMessage` handlers too.
+- Method- and class-level `@UsePipes`, `@UseGuards`, `@UseInterceptors`, and `@UseFilters` work exactly as they do on controllers.
+- Throwing a `WsException` from a handler triggers the WebSocket exception filter chain.
+
+## Shutdown
+
+`SocketModule.close()` iterates every server registered in the `SocketsContainer`, calls `adapter.close(server)` on each, awaits `adapter.dispose()`, and clears the container. This runs as part of normal Nest shutdown, so `app.close()` cleans up all WebSocket servers you created.
