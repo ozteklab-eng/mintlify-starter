@@ -1,0 +1,196 @@
+---
+title: "Platform adapters"
+description: "Serve a Nest application over Express or Fastify using the built-in HTTP platform adapters"
+---
+
+Nest sits on top of a pluggable HTTP layer. A **platform adapter** is the concrete implementation of that layer. Nest ships two first-party adapters:
+
+- `ExpressAdapter` from `@nestjs/platform-express`, backed by [Express](https://expressjs.com/).
+- `FastifyAdapter` from `@nestjs/platform-fastify`, backed by [Fastify](https://fastify.dev/).
+
+Both classes extend the same `AbstractHttpAdapter` from `@nestjs/core`, so features that live in Nest's core (guards, interceptors, pipes, exception filters, middleware, versioning, CORS, streaming responses) work the same regardless of which adapter you choose. Pick the adapter based on the underlying framework you want to target.
+
+## When to use each adapter
+
+| Use case | Adapter |
+| --- | --- |
+| Default, largest ecosystem, most middleware compatibility | `ExpressAdapter` |
+| Highest throughput, JSON-schema-based validation, Fastify plugin ecosystem | `FastifyAdapter` |
+
+`@nestjs/platform-express` is the default. If you scaffold an app with `NestFactory.create(AppModule)` and pass no adapter, Express is used.
+
+## Express adapter
+
+### Setup
+
+```ts
+import { NestFactory } from '@nestjs/core';
+import { ExpressAdapter, type NestExpressApplication } from '@nestjs/platform-express';
+import { AppModule } from './app.module';
+
+async function bootstrap() {
+  const app = await NestFactory.create<NestExpressApplication>(
+    AppModule,
+    new ExpressAdapter(),
+  );
+  await app.listen(3000);
+}
+bootstrap();
+```
+
+Pass an existing Express instance to reuse app-level middleware or share the instance with another server:
+
+```ts
+import express from 'express';
+
+const server = express();
+const app = await NestFactory.create<NestExpressApplication>(
+  AppModule,
+  new ExpressAdapter(server),
+);
+```
+
+### What `ExpressAdapter` gives you
+
+- The full `INestApplication` surface plus Express-specific helpers exposed through the `NestExpressApplication` interface (for example `app.set(...)`, `app.engine(...)`, `app.useStaticAssets(...)`, `app.setBaseViewsDir(...)`).
+- Built-in support for `cors`, `path-to-regexp` route matching, and versioning (URI, header, media type, custom).
+- Streaming responses via `StreamableFile`.
+- Request and response hooks with `setOnRequestHook()` and `setOnResponseHook()` that run before route handlers and after the response is sent, respectively.
+- Graceful shutdown: in-flight sockets are tracked so `app.close()` can wait for them to drain.
+
+### File uploads with Multer
+
+`@nestjs/platform-express` re-exports a set of Multer-based interceptors from its `multer` entry point. Bind them to a route handler with `@UseInterceptors()` and read files with `@UploadedFile()` / `@UploadedFiles()`.
+
+| Interceptor | Use for |
+| --- | --- |
+| `FileInterceptor(fieldName, options?)` | A single file on one form field. |
+| `FilesInterceptor(fieldName, maxCount?, options?)` | Multiple files on a single field. |
+| `FileFieldsInterceptor(fields[], options?)` | Multiple named fields, each with its own file(s). |
+| `AnyFilesInterceptor(options?)` | Any files on any field. |
+| `NoFilesInterceptor(options?)` | Reject any file field on the request. |
+
+```ts
+import { Controller, Post, UploadedFile, UseInterceptors } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+
+@Controller('uploads')
+export class UploadsController {
+  @Post()
+  @UseInterceptors(FileInterceptor('file'))
+  upload(@UploadedFile() file: Express.Multer.File) {
+    return { filename: file.originalname, size: file.size };
+  }
+}
+```
+
+Register `MulterModule` once to share options (storage engine, limits, file filter) across the app:
+
+```ts
+import { MulterModule } from '@nestjs/platform-express';
+
+@Module({
+  imports: [
+    MulterModule.register({
+      dest: './uploads',
+      limits: { fileSize: 5 * 1024 * 1024 },
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+`MulterModule.registerAsync()` is available if you need to build options from a config service.
+
+## Fastify adapter
+
+### Setup
+
+```ts
+import { NestFactory } from '@nestjs/core';
+import { FastifyAdapter, type NestFastifyApplication } from '@nestjs/platform-fastify';
+import { AppModule } from './app.module';
+
+async function bootstrap() {
+  const app = await NestFactory.create<NestFastifyApplication>(
+    AppModule,
+    new FastifyAdapter(),
+  );
+  await app.listen(3000, '0.0.0.0');
+}
+bootstrap();
+```
+
+`FastifyAdapter` accepts the same options object as `fastify()` (logger, HTTP/2, trust proxy, request ID, and so on) plus a Nest-specific `skipMiddie` flag:
+
+```ts
+new FastifyAdapter({
+  logger: true,
+  trustProxy: true,
+  skipMiddie: false, // set to true to opt out of Express-style middleware support
+});
+```
+
+By default, Nest registers the `middie` plugin so that Express-style `(req, res, next)` middleware keeps working on top of Fastify. Set `skipMiddie: true` if you only use Fastify hooks and want to skip that plugin.
+
+### What `FastifyAdapter` gives you
+
+- The full `INestApplication` surface plus Fastify-specific helpers exposed through the `NestFastifyApplication` interface, including `app.register(plugin, opts)` for Fastify plugins, `app.inject(opts)` for in-process request injection (backed by [`light-my-request`](https://github.com/fastify/light-my-request)), and `app.useBodyParser(...)` for on-the-fly body parser registration.
+- All HTTP verbs Fastify supports, including WebDAV-style methods (`propfind`, `proppatch`, `mkcol`, `copy`, `move`, `lock`, `unlock`) alongside the standard ones.
+- `StreamableFile` responses, request/response hooks (`setOnRequestHook`, `setOnResponseHook`), CORS via `@fastify/cors`, and versioning parity with Express.
+
+### Fastify-specific decorators
+
+Fastify exposes per-route metadata that has no Express equivalent. `@nestjs/platform-fastify` surfaces it through three decorators applied to controller methods:
+
+| Decorator | Purpose |
+| --- | --- |
+| `@RouteConfig(config)` | Attach an arbitrary [route `config`](https://fastify.dev/docs/latest/Reference/Routes/#config) object that hooks and handlers can read via `request.routeOptions.config`. |
+| `@RouteConstraints(constraints)` | Add Fastify [route constraints](https://fastify.dev/docs/latest/Reference/Routes/#constraints), for example version or host constraints. |
+| `@RouteSchema(schema)` | Attach a Fastify [route schema](https://fastify.dev/docs/latest/Reference/Routes/#routes-options) for `body`, `querystring` / `query`, `params`, and `response` validation and serialization. |
+
+```ts
+import { Controller, Get } from '@nestjs/common';
+import { RouteConfig, RouteConstraints, RouteSchema } from '@nestjs/platform-fastify';
+
+@Controller('cats')
+export class CatsController {
+  @Get()
+  @RouteSchema({
+    response: {
+      200: {
+        type: 'array',
+        items: { type: 'object', properties: { name: { type: 'string' } } },
+      },
+    },
+  })
+  @RouteConfig({ rateLimit: { max: 100, timeWindow: '1 minute' } })
+  @RouteConstraints({ version: '1.0.0' })
+  findAll() {
+    return [{ name: 'Grumpy' }];
+  }
+}
+```
+
+## How adapters plug into the core
+
+Both `ExpressAdapter` and `FastifyAdapter` extend `AbstractHttpAdapter` from `@nestjs/core`. `AbstractHttpAdapter` defines the contract that Nest's router, middleware container, and exception layer call into: methods for registering routes per HTTP verb, resolving request and response objects, applying versioning, and writing status codes, headers, redirects, and streaming bodies.
+
+Because every adapter implements the same contract, controllers, providers, guards, interceptors, pipes, and exception filters written against `@nestjs/common` are portable. Swapping platforms is a one-line change in `main.ts`:
+
+```ts
+// Before: Express (default)
+const app = await NestFactory.create(AppModule);
+
+// After: Fastify
+const app = await NestFactory.create<NestFastifyApplication>(
+  AppModule,
+  new FastifyAdapter(),
+);
+```
+
+The trade-offs to keep in mind when switching:
+
+- Multer-based file-upload interceptors from `@nestjs/platform-express` are Express-only. On Fastify, register [`@fastify/multipart`](https://github.com/fastify/fastify-multipart) with `app.register(...)` instead.
+- Express middleware is supported on Fastify through `middie`, but Fastify plugins are not usable on Express.
+- Adapter-specific helpers on `NestExpressApplication` and `NestFastifyApplication` are not interchangeable. Only cast to the interface that matches the adapter you actually pass to `NestFactory.create`.
