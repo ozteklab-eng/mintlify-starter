@@ -1,0 +1,76 @@
+---
+title: "Guards"
+description: "Authorization checks that decide whether the route handler runs."
+---
+
+A guard answers a single question: *should this request be allowed to reach the controller method?* Guards run after middleware and before interceptors and pipes. If any guard returns `false` (or a promise/observable that resolves to `false`), the pipeline throws `ForbiddenException` and the response is written by an exception filter.
+
+## Writing a guard
+
+Implement `CanActivate`. `canActivate()` receives the `ExecutionContext`, so it can read the request, the target class, and the target handler for reflected metadata.
+
+```ts
+import { CanActivate, ExecutionContext, Injectable } from '@nestjs/common';
+import { Reflector } from '@nestjs/core';
+
+@Injectable()
+export class RolesGuard implements CanActivate {
+  constructor(private readonly reflector: Reflector) {}
+
+  canActivate(context: ExecutionContext): boolean {
+    const requiredRoles = this.reflector.get<string[]>('roles', context.getHandler());
+    if (!requiredRoles) return true;
+
+    const request = context.switchToHttp().getRequest();
+    return requiredRoles.some(role => request.user?.roles?.includes(role));
+  }
+}
+```
+
+## Binding
+
+- Method: `@UseGuards(RolesGuard)` on a handler.
+- Controller: `@UseGuards(RolesGuard)` on the class.
+- Global: `app.useGlobalGuards(new RolesGuard(...))` or the `APP_GUARD` provider (needed if the guard has dependencies).
+
+## Execution semantics
+
+The consumer is `GuardsConsumer` in `packages/core/guards/guards-consumer.ts`. Its `tryActivate()` method drives the guard list:
+
+```ts
+for (const guard of guards) {
+  const result = guard.canActivate(context);
+  if (typeof result === 'boolean') {
+    if (!result) return false;
+    continue;
+  }
+  if (await this.pickResult(result)) continue;
+  return false;
+}
+return true;
+```
+
+This has three consequences worth calling out:
+
+- **Short-circuit on the first denial.** As soon as any guard returns `false`, later guards in the list are never called.
+- **Synchronous booleans stay synchronous.** A guard that returns a plain `true`/`false` doesn't force an `await`; only promises and observables are unwrapped via `pickResult()`.
+- **Observables are collapsed with `lastValueFrom`.** If your guard returns an `Observable<boolean>`, only its last emitted value is used.
+
+The composed function is built in `RouterExecutionContext.createGuardsFn()`:
+
+```ts
+public createGuardsFn(guards, instance, callback, contextType) {
+  return async args => {
+    const canActivate = await this.guardsConsumer.tryActivate(guards, args, instance, callback, contextType);
+    if (!canActivate) {
+      throw new ForbiddenException(FORBIDDEN_MESSAGE);
+    }
+  };
+}
+```
+
+A denial always surfaces as a `ForbiddenException`, which is then handled by whatever exception filter matches (by default, `BaseExceptionFilter` writes a `403` response).
+
+## Order relative to other extension points
+
+Guards run **before** interceptors and pipes. If you need to reject requests based on a value you'd have to *parse* first (e.g. numeric ID range), do the parsing in a guard yourself — do not rely on pipes having already run.

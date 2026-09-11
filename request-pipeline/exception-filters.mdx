@@ -1,0 +1,100 @@
+---
+title: "Exception filters"
+description: "Catch errors thrown anywhere in the request pipeline and turn them into HTTP responses."
+---
+
+Any error thrown by middleware, a guard, an interceptor, a pipe, or the controller method is caught by the router proxy and routed to an exception filter. Filters own the response for the error case: status code, body shape, headers.
+
+## The default filter
+
+If no custom filter matches, `BaseExceptionFilter` in `packages/core/exceptions/base-exception-filter.ts` handles the exception:
+
+- **`HttpException` (and subclasses).** The filter reads `exception.getResponse()`. If that's an object, it's used verbatim; otherwise the response body is `{ statusCode, message, errorCode? }`. It writes with `applicationRef.reply(response, message, exception.getStatus())`.
+- **Unknown errors.** Handled by `handleUnknownError()`. If the error looks like a Fastify error or a `http-errors` error (`err.statusCode` + `err.message`), the status code and message from the error are reused. Otherwise the response is `500` with the generic `MESSAGES.UNKNOWN_EXCEPTION_MESSAGE`. Unknown errors that are not `IntrinsicException` are logged via `BaseExceptionFilter.logger.error(exception)`.
+- **Headers already sent.** If `applicationRef.isHeadersSent(response)` is `true`, the filter calls `applicationRef.end(response)` instead of trying to write a body.
+
+## Built-in exceptions
+
+`packages/common/exceptions` exports the standard HTTP exceptions, all extending `HttpException`:
+
+`BadRequestException`, `UnauthorizedException`, `ForbiddenException`, `NotFoundException`, `MethodNotAllowedException`, `NotAcceptableException`, `RequestTimeoutException`, `ConflictException`, `GoneException`, `HttpVersionNotSupportedException`, `PayloadTooLargeException`, `UnsupportedMediaTypeException`, `UnprocessableEntityException`, `MisdirectedException`, `PreconditionFailedException`, `ImATeapotException`, `InternalServerErrorException`, `NotImplementedException`, `BadGatewayException`, `ServiceUnavailableException`, `GatewayTimeoutException`.
+
+`HttpException` itself accepts `(response, status, options?)`, where `response` becomes the JSON body (string or object) and `options.cause` preserves the original error:
+
+```ts
+throw new HttpException('message', HttpStatus.BAD_REQUEST);
+throw new HttpException(
+  { statusCode: 400, message: 'invalid', errorCode: 'E_INVALID' },
+  HttpStatus.BAD_REQUEST,
+  { cause: originalError },
+);
+```
+
+## Writing a custom filter
+
+Implement `ExceptionFilter<T>` and decorate with `@Catch()`:
+
+```ts
+import { ArgumentsHost, Catch, ExceptionFilter, HttpException } from '@nestjs/common';
+
+@Catch(HttpException)
+export class HttpExceptionFilter implements ExceptionFilter<HttpException> {
+  catch(exception: HttpException, host: ArgumentsHost) {
+    const ctx = host.switchToHttp();
+    const response = ctx.getResponse();
+    const status = exception.getStatus();
+    response.status(status).json({
+      statusCode: status,
+      path: ctx.getRequest().url,
+      message: exception.message,
+    });
+  }
+}
+```
+
+## Binding
+
+- Method: `@UseFilters(HttpExceptionFilter)` on a handler.
+- Controller: `@UseFilters(HttpExceptionFilter)` on the class.
+- Global: `app.useGlobalFilters(new HttpExceptionFilter())` or the `APP_FILTER` provider.
+
+## How the pipeline picks a filter
+
+`ExceptionsHandler` (extends `BaseExceptionFilter`) in `packages/core/exceptions/exceptions-handler.ts` walks the list of registered custom filters and calls the first one whose `@Catch()` metadata matches the thrown value:
+
+```ts
+public next(exception, ctx) {
+  if (this.invokeCustomFilters(exception, ctx)) return;
+  super.catch(exception, ctx);
+}
+
+public invokeCustomFilters(exception, ctx): boolean {
+  if (isEmptyArray(this.filters)) return false;
+  const filter = selectExceptionFilterMetadata(this.filters, exception);
+  filter && filter.func(exception, ctx);
+  return !!filter;
+}
+```
+
+Two consequences:
+
+- **First-match wins.** Ordering matters. Bind the most specific `@Catch(SpecificException)` filter before a broader `@Catch()` filter that catches everything.
+- **Fallback is `BaseExceptionFilter`.** If no custom filter matches, `super.catch()` runs and applies the default behavior described above.
+
+## Where in the pipeline errors are caught
+
+`RouterProxy.createProxy()` in `packages/core/router/router-proxy.ts` wraps the composed route handler:
+
+```ts
+return async (req, res, next) => {
+  try {
+    await targetCallback(req, res, next);
+  } catch (e) {
+    const host = new ExecutionContextHost([req, res, next]);
+    exceptionsHandler.next(e, host);
+    return res;
+  }
+};
+```
+
+This is the single try/catch that covers guards, interceptors, pipes, and the controller method. Middleware errors are caught the same way, because middleware handlers registered by `MiddlewareModule` are also wrapped with `RouterProxy.createProxy()` before being handed to the HTTP adapter.

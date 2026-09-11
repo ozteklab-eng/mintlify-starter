@@ -1,0 +1,73 @@
+---
+title: "Interceptors"
+description: "Wrappers around the route handler that can transform inputs, outputs, and exceptions using RxJS."
+---
+
+An interceptor wraps the handler with an RxJS-style `intercept(context, next)` function. It sees the incoming call, can decide whether and when to invoke `next.handle()`, and observes the result stream on the way out. Use interceptors for logging, timing, response mapping, caching, and any cross-cutting behavior that needs both an `ExecutionContext` and the response value.
+
+## Writing an interceptor
+
+```ts
+import { CallHandler, ExecutionContext, Injectable, NestInterceptor } from '@nestjs/common';
+import { Observable } from 'rxjs';
+import { map, tap } from 'rxjs/operators';
+
+@Injectable()
+export class LoggingInterceptor implements NestInterceptor {
+  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
+    const now = Date.now();
+    return next
+      .handle()
+      .pipe(
+        tap(() => console.log(`${context.getClass().name}#${context.getHandler().name} ${Date.now() - now}ms`)),
+        map(data => ({ data })),
+      );
+  }
+}
+```
+
+## Binding
+
+- Method: `@UseInterceptors(LoggingInterceptor)` on a handler.
+- Controller: `@UseInterceptors(LoggingInterceptor)` on the class.
+- Global: `app.useGlobalInterceptors(new LoggingInterceptor())` or the `APP_INTERCEPTOR` provider.
+
+## Execution semantics
+
+The chain is built in `InterceptorsConsumer.intercept()` (`packages/core/interceptors/interceptors-consumer.ts`) as a recursive `nextFn`:
+
+```ts
+const nextFn = async (i = 0) => {
+  if (i >= interceptors.length) {
+    return defer(AsyncResource.bind(() => this.transformDeferred(next)));
+  }
+  const handler: CallHandler = {
+    handle: () => defer(AsyncResource.bind(() => nextFn(i + 1))).pipe(mergeAll()),
+  };
+  return interceptors[i].intercept(context, handler);
+};
+return defer(() => nextFn()).pipe(mergeAll());
+```
+
+Key behaviors you can rely on:
+
+- **Onion order.** The first interceptor in the list is outermost. Its `intercept()` runs first on the way in, and its RxJS operators run last on the way out.
+- **`next.handle()` is deferred.** Nothing after the interceptor runs until you subscribe to the observable returned by `handle()` (or return it from a pipe). If you never call it, the handler never runs.
+- **Async context is preserved.** `nextFn` is wrapped with `AsyncResource.bind`, so `AsyncLocalStorage` values set upstream flow through into the handler and into subsequent interceptors.
+- **The result is normalized to an observable.** `transformDeferred()` calls the handler eagerly (to keep async context) and wraps a `Promise`, `Observable`, or plain value into a single `Observable` the outer chain subscribes to.
+- **Subscriber teardown short-circuits.** If the caller unsubscribes (for example, an SSE client disconnects) before the async handler resolves, the producer is never subscribed — it will not start side effects only to abort them immediately.
+
+## Ordering relative to pipes and the handler
+
+At the innermost layer of the interceptor chain, `RouterExecutionContext.create()` invokes:
+
+```ts
+const handler = (args, req, res, next) => async () => {
+  fnApplyPipes && (await fnApplyPipes(args, req, res, next));
+  return callback.apply(instance, args);
+};
+```
+
+So each interceptor's *pre*-work runs before pipes; pipes run only when the innermost `next.handle()` is subscribed; the controller method runs immediately after pipes; and each interceptor's *post*-work runs as RxJS operators on the returned stream, in reverse order.
+
+Errors thrown by the handler or by pipes propagate through the observable and can be caught by interceptors using `catchError`. Anything that escapes the outer observable is caught by `RouterProxy` and delegated to [exception filters](/request-pipeline/exception-filters).

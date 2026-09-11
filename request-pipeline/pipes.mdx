@@ -1,0 +1,74 @@
+---
+title: "Pipes"
+description: "Per-argument transformation and validation applied before the route handler is called."
+---
+
+A pipe transforms one argument to the controller method (`@Param`, `@Query`, `@Body`, `@Headers`, etc.). Pipes run after guards and after the pre-work of every interceptor, immediately before the handler body. Use them for parsing (string → number, string → UUID), coercion (`DefaultValuePipe`), and per-request schema validation.
+
+## Writing a pipe
+
+Implement `PipeTransform`. The `transform()` method receives the raw value and an `ArgumentMetadata` object describing where the value came from and its declared metatype.
+
+```ts
+import { ArgumentMetadata, BadRequestException, Injectable, PipeTransform } from '@nestjs/common';
+
+@Injectable()
+export class TrimPipe implements PipeTransform<string, string> {
+  transform(value: string, metadata: ArgumentMetadata): string {
+    if (typeof value !== 'string') {
+      throw new BadRequestException(`Expected a string for ${metadata.data}`);
+    }
+    return value.trim();
+  }
+}
+```
+
+## Binding
+
+- Parameter: `@Param('id', ParseIntPipe)` — the tightest binding, only that one argument.
+- Method: `@UsePipes(new ValidationPipe())` on a handler.
+- Controller: `@UsePipes(...)` on the class.
+- Global: `app.useGlobalPipes(new ValidationPipe())` or the `APP_PIPE` provider.
+
+## Built-in pipes
+
+Shipped from `packages/common/pipes`:
+
+- `ValidationPipe` — validates against a class or Standard Schema; can transform and strip unknown properties.
+- `StandardSchemaValidationPipe` — validates against a Standard Schema instance.
+- `ParseIntPipe`, `ParseFloatPipe`, `ParseBoolPipe`, `ParseDatePipe`, `ParseUUIDPipe`, `ParseEnumPipe`, `ParseArrayPipe` — coerce a single value; each accepts `{ errorHttpStatusCode, exceptionFactory, optional }` so you can control the failure response.
+- `DefaultValuePipe` — supplies a fallback when the argument is `null` or `undefined`.
+- File pipes (under `packages/common/pipes/file`) — validate uploads.
+
+`ParseIntPipe`'s failure path is a good example of the shared contract used by every parser pipe:
+
+```ts
+if (!this.isNumeric(value)) {
+  throw this.exceptionFactory('Validation failed (numeric string is expected)');
+}
+return parseInt(String(value), 10);
+```
+
+By default `exceptionFactory` returns `new HttpErrorByCode[HttpStatus.BAD_REQUEST](error)`, i.e. a `400`. Pass your own `exceptionFactory` (or a different `errorHttpStatusCode`) to change that.
+
+## Execution semantics
+
+The chain is `PipesConsumer.applyPipes()` in `packages/core/pipes/pipes-consumer.ts`:
+
+```ts
+let result = value;
+for (const pipe of transforms) {
+  result = await pipe.transform(result, { metatype, type, data, schema });
+}
+return result;
+```
+
+So:
+
+- Pipes are **awaited sequentially** — a later pipe sees the transformed output of the earlier pipe.
+- Each argument is transformed **independently**; the pipe list is composed per parameter by `RouterExecutionContext.createPipesFn()`.
+- The first pipe to throw short-circuits the argument. That error propagates out of the handler wrapper in `RouterExecutionContext.create()`, through the interceptor observable, and into the [exception filter](/request-pipeline/exception-filters) chain.
+
+## Ordering relative to interceptors
+
+Because pipes run inside the innermost handler function (`handler(args, req, res, next)`), every interceptor's `intercept()` pre-work has already run by the time pipes execute. That means an interceptor can inspect the raw request before pipes touch it, but it cannot see the parsed/validated arguments — those only exist inside the handler.

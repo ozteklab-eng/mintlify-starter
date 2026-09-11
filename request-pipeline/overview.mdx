@@ -1,0 +1,66 @@
+---
+title: "Request pipeline"
+description: "How an HTTP request flows through middleware, guards, interceptors, pipes, the route handler, and exception filters."
+---
+
+Every HTTP request passes through the same fixed pipeline before your controller method runs and before the response is written. Read this page first if you're deciding *where* to plug in cross-cutting logic (auth, logging, transformation, validation, error mapping).
+
+## What you can plug in
+
+There are five extension points, in the order the pipeline invokes them:
+
+1. **Middleware** — plain adapter-level handlers (Express or Fastify style) run at the router layer, before Nest builds the execution context.
+2. **Guards** — decide whether the handler is allowed to run for this request.
+3. **Interceptors (pre)** — wrap the handler; can mutate the incoming call, add cross-cutting behavior, and bind async context.
+4. **Pipes** — transform and validate each method argument.
+5. **Route handler** — your controller method executes.
+6. **Interceptors (post)** — the same interceptors' `RxJS` stream sees the return value and can map it.
+7. **Exception filters** — if anything above throws, the filter catches it and writes the response.
+
+## Where it's implemented
+
+The end-to-end sequence for a static-scope handler is assembled in `packages/core/router/router-execution-context.ts`, in the function returned by `RouterExecutionContext.create()`. Reading top-to-bottom in that method shows the exact ordering:
+
+1. `fnCanActivate([req, res, next])` — runs guards (see [Guards](/request-pipeline/guards)).
+2. `responseController.setStatus` / `setHeaders` — applies `@HttpCode()` and `@Header()` metadata.
+3. `interceptorsConsumer.intercept(...)` — enters the interceptor chain; the innermost handler (`handler(args, req, res, next)`) is what runs pipes and then invokes the controller (see [Interceptors](/request-pipeline/interceptors)).
+4. Inside `handler`, `fnApplyPipes(args, req, res, next)` runs per-argument pipes (see [Pipes](/request-pipeline/pipes)).
+5. `callback.apply(instance, args)` — your controller method.
+6. `fnHandleResponse(result, res, req)` — writes the body via the HTTP adapter.
+
+Middleware runs earlier, at the HTTP adapter's router layer, registered by `MiddlewareModule.registerHandler()` in `packages/core/middleware/middleware-module.ts` (see [Middleware](/request-pipeline/middleware)).
+
+Any throw at any stage is caught by `RouterProxy.createProxy()` in `packages/core/router/router-proxy.ts`, which delegates to `ExceptionsHandler.next()` in `packages/core/exceptions/exceptions-handler.ts` (see [Exception filters](/request-pipeline/exception-filters)).
+
+## Full order for one request
+
+```
+HTTP adapter receives request
+  └─ Middleware chain (packages/core/middleware/middleware-module.ts)
+       └─ Route matched → RouterProxy wraps the handler with ExceptionsHandler
+            └─ Guards (GuardsConsumer.tryActivate)
+                 └─ Interceptors — before next()
+                      └─ Pipes (PipesConsumer.applyPipes) — per argument
+                           └─ Controller method
+                      └─ Interceptors — after next() (RxJS operators on the result)
+                 └─ RouterResponseController writes the response
+       └─ (on any throw) ExceptionsHandler.next() → matching filter or BaseExceptionFilter
+```
+
+## Choosing the right extension point
+
+| You want to... | Use |
+| --- | --- |
+| Run adapter-native middleware (e.g. `helmet`, `cookie-parser`) or match by path/method independent of a controller | [Middleware](/request-pipeline/middleware) |
+| Allow or deny a request based on roles, tokens, or feature flags | [Guards](/request-pipeline/guards) |
+| Add logging, caching, timeouts, or transform the response shape | [Interceptors](/request-pipeline/interceptors) |
+| Parse, coerce, or validate a single argument (`@Param`, `@Query`, `@Body`, ...) | [Pipes](/request-pipeline/pipes) |
+| Map thrown errors to HTTP responses | [Exception filters](/request-pipeline/exception-filters) |
+
+## Binding scope
+
+Every extension point can be bound at three scopes. The binding scope is orthogonal to the pipeline order above — a global guard still runs at the guards stage, not before middleware.
+
+- **Global** — via `app.useGlobal*` on the `NestApplication` or via `APP_GUARD` / `APP_INTERCEPTOR` / `APP_PIPE` / `APP_FILTER` providers.
+- **Controller** — via `@UseGuards()`, `@UseInterceptors()`, `@UsePipes()`, `@UseFilters()` on the class.
+- **Method** — the same decorators on a specific handler; pipes additionally accept parameter-level binding via `@Param('id', ParseIntPipe)`.
