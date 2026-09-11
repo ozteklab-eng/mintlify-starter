@@ -1,0 +1,208 @@
+---
+title: "Testing utilities"
+description: "Build isolated testing modules, override providers, and boot a Nest application inside your tests."
+---
+
+The `@nestjs/testing` package builds a Nest module for tests. You compose it with the same metadata you use in production, swap out any provider, guard, filter, interceptor, pipe, or nested module you want to replace, then compile the result into a `TestingModule` that behaves like a real Nest application.
+
+Use it when you want a test to run against Nest's real dependency injection container instead of hand-wiring classes, and when you need to replace parts of a module with stubs, mocks, or spies.
+
+## When to use it
+
+Reach for the testing package when you want to:
+
+- Instantiate a controller or provider with its real dependency graph resolved.
+- Replace a specific provider, guard, interceptor, filter, or pipe with a mock without editing the production module.
+- Swap an entire imported module for a lighter test double.
+- Boot the compiled module as an HTTP application or microservice for end-to-end tests.
+- Auto-mock every unresolved dependency instead of registering each one by hand.
+
+## Create a testing module
+
+Start from `Test.createTestingModule(metadata, options?)`. It returns a `TestingModuleBuilder` that mirrors `@Module()` metadata (`imports`, `controllers`, `providers`, `exports`).
+
+```ts
+import { Test } from '@nestjs/testing';
+import { CatsController } from './cats.controller';
+import { CatsService } from './cats.service';
+
+const moduleRef = await Test.createTestingModule({
+  controllers: [CatsController],
+  providers: [CatsService],
+}).compile();
+
+const catsService = moduleRef.get(CatsService);
+```
+
+`compile()` scans dependencies, applies any overrides you registered on the builder, instantiates every provider, and returns a `TestingModule` that extends Nest's application context. From there you can call `get()`, `resolve()`, or promote it to a full application (see [Boot a Nest application](#boot-a-nest-application-from-the-testing-module)).
+
+### Builder options
+
+`createTestingModule` accepts a second argument with the following fields:
+
+| Option                       | Description                                                              |
+| ---------------------------- | ------------------------------------------------------------------------ |
+| `moduleIdGeneratorAlgorithm` | Controls how internal module IDs are generated. Forwarded to the Nest container. |
+
+`compile()` accepts its own options:
+
+| Option     | Description                                                                                                                   |
+| ---------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `snapshot` | When `true`, records a deterministic dependency graph and switches UUID generation to deterministic mode. Useful for graph inspection tests. |
+| `preview`  | When `true`, instantiates providers in preview mode so side effects from constructors are skipped.                            |
+
+## Override providers, guards, interceptors, filters, and pipes
+
+`TestingModuleBuilder` exposes one override method per injection kind. Each returns an `OverrideBy` object with `useValue`, `useClass`, and `useFactory`. Chain the terminal call and you get the builder back so you can queue more overrides before `compile()`.
+
+| Method                | Replaces                                       |
+| --------------------- | ---------------------------------------------- |
+| `overrideProvider`    | Any provider registered in the module tree.    |
+| `overrideGuard`       | A guard bound with `APP_GUARD` or `@UseGuards`. |
+| `overrideInterceptor` | An interceptor bound with `APP_INTERCEPTOR` or `@UseInterceptors`. |
+| `overrideFilter`      | An exception filter bound with `APP_FILTER` or `@UseFilters`. |
+| `overridePipe`        | A pipe bound with `APP_PIPE` or `@UsePipes`.    |
+| `overrideModule`      | An imported module. Call `.useModule(NewModule)` to substitute. |
+
+```ts
+const moduleRef = await Test.createTestingModule({
+  controllers: [CatsController],
+  providers: [CatsService],
+})
+  .overrideProvider(CatsService)
+  .useValue({ findAll: () => ['mocked cat'] })
+  .overrideGuard(AuthGuard)
+  .useValue({ canActivate: () => true })
+  .overrideInterceptor(LoggingInterceptor)
+  .useClass(NoopInterceptor)
+  .overrideModule(ConfigModule)
+  .useModule(TestConfigModule)
+  .compile();
+```
+
+`useFactory` receives an object with a `factory` function and an optional `inject` array:
+
+```ts
+.overrideProvider(MailerService)
+.useFactory({
+  factory: (config: ConfigService) => new StubMailer(config.get('MAIL_URL')),
+  inject: [ConfigService],
+})
+```
+
+## Auto-mock unresolved dependencies
+
+Pass a `MockFactory` to `useMocker(mocker)` on the builder to supply a stub for any dependency the container fails to resolve. The factory receives the injection token and returns the mocked instance. Return `undefined` to let the original error surface.
+
+```ts
+const moduleRef = await Test.createTestingModule({
+  controllers: [CatsController],
+})
+  .useMocker((token) => {
+    if (token === CatsService) {
+      return { findAll: () => [] };
+    }
+  })
+  .compile();
+```
+
+Under the hood, `TestingInstanceLoader` hands the mocker to `TestingInjector`. When a dependency cannot be resolved through the normal graph, `TestingInjector` calls the mocker, wraps the returned value in an `InstanceWrapper`, and registers it on the internal core module so downstream injections keep working.
+
+## Swap the logger
+
+Nest's global logger writes to stdout during tests unless you replace it. Call `setLogger(logger)` on the builder to install any `LoggerService`. If you don't, `compile()` installs `TestingLogger`, which extends `ConsoleLogger`, silences `log`, `warn`, `debug`, and `verbose`, and still forwards `error` to the console so failures stay visible.
+
+```ts
+import { TestingLogger } from '@nestjs/testing';
+
+Test.createTestingModule({ /* ... */ })
+  .setLogger(new TestingLogger())
+  .compile();
+```
+
+## Boot a Nest application from the testing module
+
+`TestingModule` extends `NestApplicationContext`, so once compiled it exposes everything an application context does plus two factory methods for full runtimes.
+
+### `createNestApplication(httpAdapter?, options?)`
+
+Returns an `INestApplication`. Pass an `HttpServer` or `AbstractHttpAdapter` as the first argument to control the transport; omit it and the testing module loads `@nestjs/platform-express` and creates an `ExpressAdapter` for you. The returned instance is a proxy that falls back to the underlying adapter for properties the application does not define, so calls like `app.getHttpServer()` and adapter-specific helpers both work.
+
+```ts
+const app = moduleRef.createNestApplication();
+await app.init();
+```
+
+### `createNestMicroservice(options)`
+
+Returns an `INestMicroservice`. Requires `@nestjs/microservices` to be installed. Pass the same options object you would give to `NestFactory.createMicroservice`.
+
+```ts
+const app = moduleRef.createNestMicroservice({
+  transport: Transport.TCP,
+  options: { port: 4000 },
+});
+await app.listen();
+```
+
+Both factories reapply any logger passed on their `options.logger` field before wiring the container.
+
+## API reference
+
+<ResponseField name="Test.createTestingModule(metadata, options?)" type="static method">
+  Returns a `TestingModuleBuilder`. `metadata` is a standard `ModuleMetadata` object. `options` currently accepts `moduleIdGeneratorAlgorithm`.
+</ResponseField>
+
+<ResponseField name="TestingModuleBuilder" type="class">
+  Fluent builder for a test module. Every override method returns an `OverrideBy` object; every other method returns the builder.
+
+  <Expandable title="Methods">
+    <ResponseField name="setLogger(logger)" type="method">
+      Registers a `LoggerService` that replaces the global logger during `compile()`.
+    </ResponseField>
+    <ResponseField name="useMocker(mocker)" type="method">
+      Registers a `MockFactory` used to stub unresolved dependencies.
+    </ResponseField>
+    <ResponseField name="overrideProvider(typeOrToken)" type="method">
+      Replaces a provider. Returns `OverrideBy`.
+    </ResponseField>
+    <ResponseField name="overrideGuard(typeOrToken)" type="method">
+      Replaces a guard. Returns `OverrideBy`.
+    </ResponseField>
+    <ResponseField name="overrideInterceptor(typeOrToken)" type="method">
+      Replaces an interceptor. Returns `OverrideBy`.
+    </ResponseField>
+    <ResponseField name="overrideFilter(typeOrToken)" type="method">
+      Replaces an exception filter. Returns `OverrideBy`.
+    </ResponseField>
+    <ResponseField name="overridePipe(typeOrToken)" type="method">
+      Replaces a pipe. Returns `OverrideBy`.
+    </ResponseField>
+    <ResponseField name="overrideModule(moduleDefinition)" type="method">
+      Replaces an imported module. Returns `OverrideModule` with a `useModule(newModule)` finalizer.
+    </ResponseField>
+    <ResponseField name="compile(options?)" type="method">
+      Scans dependencies, applies overrides, instantiates providers, and resolves to a `TestingModule`. `options.snapshot` enables deterministic graph inspection; `options.preview` skips constructor side effects.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="OverrideBy" type="interface">
+  Terminal step of an override. `useValue(value)`, `useClass(metatype)`, and `useFactory({ factory, inject? })` all return the `TestingModuleBuilder` so you can chain more overrides.
+</ResponseField>
+
+<ResponseField name="TestingModule" type="class">
+  Extends `NestApplicationContext`. Adds `createNestApplication(httpAdapter?, options?)` and `createNestMicroservice(options)` for booting a full runtime from the compiled module.
+</ResponseField>
+
+<ResponseField name="TestingInjector" type="class">
+  Nest injector subclass used inside `compile()`. Falls back to the registered `MockFactory` when a dependency cannot be resolved and registers the mock on the internal core module so subsequent injections resolve to the same instance.
+</ResponseField>
+
+<ResponseField name="TestingInstanceLoader" type="class">
+  Instance loader subclass that wires the container and mocker into `TestingInjector` before creating instances. You rarely construct it yourself; `TestingModuleBuilder.compile()` does it for you.
+</ResponseField>
+
+<ResponseField name="TestingLogger" type="class">
+  `ConsoleLogger` subclass installed by default. Silences `log`, `warn`, `debug`, and `verbose`, and forwards `error` to the console.
+</ResponseField>
