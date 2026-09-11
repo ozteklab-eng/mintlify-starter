@@ -1,0 +1,267 @@
+---
+title: "Dependency injection and modules"
+description: "Reference for the DI container, module system, provider scopes, custom providers, dynamic modules, and ConfigurableModuleBuilder"
+---
+
+The framework wires classes together through a dependency injection (DI) container. You declare classes with `@Injectable()` and `@Module()`, and the container resolves the dependency graph at startup.
+
+Use this page as a reference when you need to know how providers are declared, how modules are composed, or how to build a reusable configurable module.
+
+## Modules
+
+A module is a class annotated with `@Module({ ... })`. Modules group controllers and providers, control what is exported to consumers, and form the graph the container walks during bootstrap.
+
+`@Module()` accepts a `ModuleMetadata` object with the following optional keys:
+
+| Key | Description |
+| --- | --- |
+| `imports` | Modules whose exported providers become visible in this module. Entries may be a class, a `DynamicModule`, a `Promise<DynamicModule>`, or a `ForwardReference`. |
+| `controllers` | Controller classes to instantiate in this module. |
+| `providers` | Providers instantiated by the injector and shared within this module. |
+| `exports` | The subset of providers (or re-exported modules) that consumers of this module can inject. |
+
+```ts
+import { Module } from '@nestjs/common';
+import { CatsController } from './cats.controller';
+import { CatsService } from './cats.service';
+
+@Module({
+  controllers: [CatsController],
+  providers: [CatsService],
+  exports: [CatsService],
+})
+export class CatsModule {}
+```
+
+### Global modules
+
+Add `@Global()` above `@Module()` to make a module's exports visible to every other module without an explicit `imports` entry. Use it sparingly — global modules make the dependency graph harder to reason about.
+
+```ts
+import { Global, Module } from '@nestjs/common';
+
+@Global()
+@Module({
+  providers: [ConfigService],
+  exports: [ConfigService],
+})
+export class ConfigModule {}
+```
+
+### Dynamic modules
+
+A dynamic module is a module whose metadata is produced at runtime by a static method (`forRoot`, `forFeature`, `register`, and similar). The method returns a `DynamicModule`, which is `ModuleMetadata` plus a `module` reference and an optional `global` flag.
+
+```ts
+import { DynamicModule, Module } from '@nestjs/common';
+
+@Module({})
+export class DatabaseModule {
+  static forRoot(options: { uri: string }): DynamicModule {
+    return {
+      module: DatabaseModule,
+      providers: [
+        { provide: 'DB_OPTIONS', useValue: options },
+        DatabaseConnection,
+      ],
+      exports: [DatabaseConnection],
+    };
+  }
+}
+```
+
+Set `global: true` on the returned object to register the dynamic module globally on that call.
+
+## Providers
+
+A provider is anything the injector can resolve when another class asks for a dependency. In its simplest form it is a class decorated with `@Injectable()`; more explicit shapes are available through custom providers.
+
+### `@Injectable()`
+
+Mark a class as a provider with `@Injectable()`. Once marked, the class can be listed in a module's `providers` array and injected into other classes.
+
+```ts
+import { Injectable } from '@nestjs/common';
+
+@Injectable()
+export class CatsService {
+  findAll() {
+    return [];
+  }
+}
+```
+
+`@Injectable()` accepts an optional `ScopeOptions` object to control the provider's lifetime and durability (see [Provider scopes](#provider-scopes)).
+
+For a provider defined in module `A` to be injectable in module `B`, `A` must list it in `exports` and `B` must list `A` in `imports` — or `A` must be marked `@Global()`.
+
+### `@Inject()`
+
+Use `@Inject(token)` to request a provider by an explicit token instead of the constructor parameter's TypeScript type. This is required when the token is a string or symbol (typical for value and factory providers).
+
+```ts
+import { Inject, Injectable } from '@nestjs/common';
+
+@Injectable()
+export class AppService {
+  constructor(@Inject('DB_OPTIONS') private readonly options: DbOptions) {}
+}
+```
+
+`@Inject()` also works as a property decorator for property-based injection.
+
+### Custom providers
+
+Instead of listing a class directly, you can pass an object that tells the injector how to produce the value bound to a token.
+
+**Class provider (`useClass`).** Bind a token to a class the container instantiates.
+
+```ts
+{
+  provide: ConfigService,
+  useClass: process.env.NODE_ENV === 'production'
+    ? ProductionConfigService
+    : DevelopmentConfigService,
+}
+```
+
+**Value provider (`useValue`).** Bind a token to a value the container hands back as-is. Useful for constants, mock objects in tests, and external instances.
+
+```ts
+{
+  provide: 'CONNECTION',
+  useValue: existingConnection,
+}
+```
+
+**Factory provider (`useFactory`).** Bind a token to the return value of a factory function. Declare the factory's own dependencies in `inject`.
+
+```ts
+{
+  provide: 'CONNECTION',
+  useFactory: (options: OptionsProvider) => new DatabaseConnection(options.get()),
+  inject: [OptionsProvider],
+}
+```
+
+**Existing provider (`useExisting`).** Create an alias — a new token that resolves to the same instance as an existing one.
+
+```ts
+{
+  provide: 'AliasedLoggerService',
+  useExisting: LoggerService,
+}
+```
+
+Class and factory providers also accept `scope` and `durable`. Value and existing providers do not.
+
+## Provider scopes
+
+A provider's scope decides how many instances the container creates and how long each instance lives. Set it through `@Injectable({ scope })` or on a custom provider.
+
+| Scope | Behavior |
+| --- | --- |
+| `Scope.DEFAULT` | One shared instance for the whole application. Created during bootstrap. This is the default. |
+| `Scope.REQUEST` | A new instance is created for each request-processing pipeline. |
+| `Scope.TRANSIENT` | A new private instance is created for every consumer that injects the provider. |
+
+```ts
+import { Injectable, Scope } from '@nestjs/common';
+
+@Injectable({ scope: Scope.REQUEST })
+export class RequestScopedService {}
+```
+
+Set `durable: true` alongside `scope: Scope.REQUEST` when combining request-scoped providers with a custom context-id strategy that groups requests into shared sub-trees.
+
+## The DI container
+
+The container is the runtime that holds every module, resolves the dependency graph, and instantiates providers on demand. Three pieces do most of the work.
+
+### `NestContainer`
+
+`NestContainer` is the top-level container. It owns the set of registered modules, the set of global modules, and the metadata for dynamic modules. During bootstrap, one `NestContainer` is created and shared across the application.
+
+The container also holds a `ModulesContainer` — the map of compiled `Module` instances keyed by their opaque module token. Each `Module` in turn owns its providers, controllers, exports, and imports.
+
+### `DependenciesScanner`
+
+`DependenciesScanner` (in `packages/core/scanner.ts`) walks the module graph twice during startup:
+
+1. `scanForModules` traverses `imports` starting from the root module, compiles each module (including dynamic modules) through `ModuleCompiler`, and registers the result on the container.
+2. `scanModulesForDependencies` reads each module's metadata, records its providers, controllers, exports, and injectables, and stores them on the corresponding `Module`.
+
+The scanner also inspects decorator metadata to detect controllers, injectables, exception filters, guards, interceptors, and pipes, and links application-level enhancers (`APP_FILTER`, `APP_GUARD`, `APP_INTERCEPTOR`, `APP_PIPE`) to the right module.
+
+### `Injector`
+
+`Injector` (in `packages/core/injector/injector.ts`) resolves the dependency graph the scanner produced. When a provider is needed, the injector:
+
+1. Reads its constructor parameter types (`PARAMTYPES_METADATA`) and any tokens declared with `@Inject()` (`SELF_DECLARED_DEPS_METADATA`).
+2. Looks up each dependency in the module's own providers, then in the providers exported by its imports, then in the global module set.
+3. Instantiates the provider through its `InstanceWrapper`, honoring the scope of the provider and — for request scope — the current `ContextId`.
+4. Applies property-based injection (`PROPERTY_DEPS_METADATA`) for any properties decorated with `@Inject()`.
+
+For unresolved dependencies the injector throws `UnknownDependenciesException`; circular imports throw `CircularDependencyException` unless broken with `forwardRef()`.
+
+## `ConfigurableModuleBuilder`
+
+`ConfigurableModuleBuilder` (in `packages/common/module-utils/`) removes the boilerplate involved in writing a configurable dynamic module. It generates the base class, the options injection token, and the option-type helpers for both synchronous and asynchronous configuration.
+
+Use it when you are shipping a module that consumers configure through `forRoot(options)` or `forRootAsync(asyncOptions)` and you don't want to hand-write the plumbing each time.
+
+### Basic usage
+
+Define the options type, build the module, and extend the generated class:
+
+```ts
+import { ConfigurableModuleBuilder } from '@nestjs/common';
+
+export interface CacheModuleOptions {
+  ttl: number;
+  store?: 'memory' | 'redis';
+}
+
+export const {
+  ConfigurableModuleClass,
+  MODULE_OPTIONS_TOKEN,
+  OPTIONS_TYPE,
+  ASYNC_OPTIONS_TYPE,
+} = new ConfigurableModuleBuilder<CacheModuleOptions>()
+  .setClassMethodName('forRoot')
+  .build();
+```
+
+```ts
+import { Module } from '@nestjs/common';
+import { ConfigurableModuleClass } from './cache.module-definition';
+
+@Module({
+  providers: [CacheService],
+  exports: [CacheService],
+})
+export class CacheModule extends ConfigurableModuleClass {}
+```
+
+Consumers then call `CacheModule.forRoot({ ttl: 60 })` (or `CacheModule.forRootAsync({ useFactory: ... })`) and inject the options with `@Inject(MODULE_OPTIONS_TOKEN)`.
+
+### Builder options
+
+Pass an options object to the constructor to customize how the builder behaves:
+
+| Option | Description |
+| --- | --- |
+| `moduleName` | Used to build a descriptive options token (for example, `Cache` becomes `CACHE_MODULE_OPTIONS`). |
+| `optionsInjectionToken` | Overrides the generated token entirely. Defaults to an auto-generated UUID unless `moduleName` is set. |
+| `alwaysTransient` | When `true`, every call to the generated static method returns a unique module instance regardless of the arguments. Defaults to `false`. |
+
+### Builder methods
+
+| Method | Purpose |
+| --- | --- |
+| `setClassMethodName(name)` | Renames the generated synchronous method (default `register`). Common choices: `forRoot`, `forFeature`. |
+| `setFactoryMethodName(name)` | Renames the factory method that async option classes must implement (default `create`). |
+| `setExtras(defaults, transform)` | Declares extra module-level options (such as `isGlobal`) and a function that folds them into the generated `DynamicModule`. |
+| `build()` | Returns `{ ConfigurableModuleClass, MODULE_OPTIONS_TOKEN, OPTIONS_TYPE, ASYNC_OPTIONS_TYPE }`. |
+
+`OPTIONS_TYPE` and `ASYNC_OPTIONS_TYPE` are type-only helpers. Use them to type the argument of any additional static methods you add to the module.
