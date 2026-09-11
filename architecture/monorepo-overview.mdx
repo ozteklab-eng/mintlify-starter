@@ -1,0 +1,193 @@
+---
+title: "Monorepo architecture overview"
+description: "How the Nest framework monorepo is organized: which packages ship to npm, what each one owns, and how they compose at runtime."
+draft: true
+---
+
+<Note>
+  This page is in **draft/review** state. It reflects the current shape of the source tree and each package's `package.json` and `index.ts` barrel; confirm details against the repo before publishing.
+</Note>
+
+## What ships from this repo
+
+The framework is a Lerna-managed npm workspaces monorepo. The root `package.json` declares:
+
+```json
+"workspaces": ["packages/*"]
+```
+
+Every directory under `packages/` is a separately published npm package. Nine of them make up the public API surface:
+
+| npm name                      | Package root                       | Purpose                                                                                       |
+| ----------------------------- | ---------------------------------- | --------------------------------------------------------------------------------------------- |
+| `@nestjs/common`              | `packages/common`                  | Decorators, DI tokens, interfaces, pipes, guards, filters, and exceptions shared by everything else. |
+| `@nestjs/core`                | `packages/core`                    | The runtime: `NestFactory`, DI container, module scanner, router, middleware, and lifecycle. |
+| `@nestjs/microservices`       | `packages/microservices`           | Transport-agnostic microservice server/client (TCP, Redis, NATS, MQTT, Kafka, RabbitMQ, gRPC). |
+| `@nestjs/websockets`          | `packages/websockets`              | Gateway model, message routing, and adapter contract for WebSocket transports.                |
+| `@nestjs/testing`             | `packages/testing`                 | `Test.createTestingModule` builder and `TestingModule` used to bootstrap apps under test.     |
+| `@nestjs/platform-express`    | `packages/platform-express`        | HTTP adapter that binds `@nestjs/core` to Express 5 and ships the Multer file-upload helpers. |
+| `@nestjs/platform-fastify`    | `packages/platform-fastify`        | HTTP adapter that binds `@nestjs/core` to Fastify 5.                                          |
+| `@nestjs/platform-socket.io`  | `packages/platform-socket.io`      | WebSocket adapter that binds `@nestjs/websockets` to socket.io.                               |
+| `@nestjs/platform-ws`         | `packages/platform-ws`             | WebSocket adapter that binds `@nestjs/websockets` to the `ws` library.                        |
+
+Every one of these declares in its own `package.json`:
+
+```json
+{
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./*.js": "./*.js",
+    "./*": "./*.js"
+  }
+}
+```
+
+That is, each package is ESM-only and re-exports from a single `index.ts` barrel at its root. `@nestjs/common`, `@nestjs/core`, and `@nestjs/websockets` additionally expose a second entry point, `./internal`, for framework-internal APIs that are not part of the public contract.
+
+## What does not ship
+
+Only `packages/*` is published. These top-level directories exist for development and are explicitly not part of the public API:
+
+- `integration/` — end-to-end integration suites (`cors`, `hooks`, `microservices`, `injector`, `graphql-*`, `mongoose`, `nest-application`, and so on). Registered as local packages by `integration/_support/register-local-packages.ts` and driven by `vitest.config.integration.mts`. Nothing under here is importable by users.
+- `sample/` — numbered example applications (`01-cats-app`, `10-fastify`, `19-auth-jwt`, `30-event-emitter`, …). They exist to demonstrate usage patterns. Do not treat their code as API.
+- `tools/benchmarks/` and `tools/gulp/` — CI benchmark scripts consumed by `codechecks:benchmarks`, plus build helpers used by `gulpfile.mjs`. Internal only.
+- Test fixtures inside each package (typically `packages/<name>/test/**`) — used by `vitest run` and never shipped.
+
+When surfacing an API in user-facing docs, verify it is re-exported from the corresponding `packages/<name>/index.ts` (or `internal.ts` when the doc is explicitly about internals). Symbols reachable only from `integration/`, `sample/`, `tools/`, or a `test/` folder are not part of the public API.
+
+## Package responsibilities and boundaries
+
+### `@nestjs/common` — the shared language
+
+`packages/common/index.ts` re-exports the vocabulary every other package builds on:
+
+```ts
+export * from './decorators/index.js';
+export * from './enums/index.js';
+export * from './exceptions/index.js';
+export * from './file-stream/index.js';
+// ...plus a curated set of interfaces:
+//   DynamicModule, Provider, INestApplication, INestMicroservice,
+//   ExecutionContext, CanActivate, NestInterceptor, PipeTransform,
+//   ExceptionFilter, OnModuleInit, OnApplicationBootstrap, ...
+```
+
+Rule of thumb: if a type or decorator needs to be understood by more than one runtime package, it lives here. `@nestjs/common` has no framework peer dependencies; it is the leaf of the graph.
+
+### `@nestjs/core` — the runtime
+
+`packages/core/index.ts` exposes the bootstrap surface plus the moving parts behind it:
+
+```ts
+export * from './adapters/index.js';
+export * from './application-config.js';
+export { APP_FILTER, APP_GUARD, APP_INTERCEPTOR, APP_PIPE } from './constants.js';
+export * from './discovery/index.js';
+export * from './injector/index.js';
+export * from './middleware/index.js';
+export * from './nest-application.js';
+export * from './nest-application-context.js';
+export { IEntryNestModule, NestFactory } from './nest-factory.js';
+export * from './router/index.js';
+// ...
+```
+
+`@nestjs/core` owns `NestFactory`, the DI container (`injector/`), the module graph, request routing, middleware execution, and lifecycle hooks. It depends on `@nestjs/common` and declares `@nestjs/platform-express`, `@nestjs/microservices`, and `@nestjs/websockets` as **optional** peer dependencies — you install only the ones you use.
+
+### `@nestjs/microservices` — transport-agnostic RPC
+
+`packages/microservices/index.ts` re-exports the client (`ClientProxy` and factories), the server transport strategies, decorators like `@MessagePattern` and `@EventPattern`, context hosts, and the record builders used to send messages with headers.
+
+Concrete transport SDKs (`@grpc/grpc-js`, `@nats-io/transport-node`, `amqplib`, `amqp-connection-manager`, `kafkajs`, `mqtt`, `ioredis`, `cache-manager`) are all optional peer dependencies. The package loads whichever driver you install; the others stay uninstalled.
+
+### `@nestjs/websockets` — gateway model
+
+`packages/websockets/index.ts` exports the gateway decorators, message-mapping metadata explorer, adapter interfaces, and exception classes. It does not open a socket by itself — that is the job of a platform adapter.
+
+`@nestjs/platform-socket.io` is listed as an optional peer dependency so the two ship as a common default pair.
+
+### `@nestjs/testing` — bootstrapping under test
+
+`packages/testing/index.ts` is intentionally small:
+
+```ts
+export * from './interfaces/index.js';
+export * from './test.js';
+export * from './testing-module.js';
+export * from './testing-module.builder.js';
+```
+
+It gives you `Test.createTestingModule(...)` and the resulting `TestingModule`, which wraps the same injector `@nestjs/core` uses in production. `@nestjs/microservices` and `@nestjs/platform-express` are optional peers, so testing works whether your app is HTTP, microservice, or context-only.
+
+### Platform adapters
+
+Each `platform-*` package is a thin binding between a Nest core and one third-party library. Its `index.ts` is minimal by design:
+
+- `platform-express/index.ts` exports `adapters/`, `interfaces/`, and the `multer/` helpers. Concrete dependencies: `express`, `cors`, `multer`.
+- `platform-fastify/index.ts` exports `adapters/`, `interfaces/`, and `decorators/`. Concrete dependency: `fastify`. `@fastify/static` and `@fastify/view` are optional peers.
+- `platform-socket.io/index.ts` exports `adapters/` only. Concrete dependency: `socket.io`.
+- `platform-ws/index.ts` exports `adapters/` only. Concrete dependency: `ws`.
+
+The platform packages are interchangeable within their category: pick exactly one HTTP adapter and, if you use gateways, exactly one WebSocket adapter.
+
+## How the packages compose at runtime
+
+Peer dependencies encode the composition rules. A typical HTTP app resolves as:
+
+```
+your app
+  └── @nestjs/core        (bootstraps the app)
+       ├── @nestjs/common (shared decorators, DI tokens, interfaces)
+       └── @nestjs/platform-express | @nestjs/platform-fastify
+            └── express | fastify
+```
+
+A microservice-only app drops the HTTP adapter:
+
+```
+your app
+  └── @nestjs/core
+       ├── @nestjs/common
+       └── @nestjs/microservices
+            └── kafkajs | mqtt | amqplib | @grpc/grpc-js | ...
+```
+
+A hybrid app (HTTP + gateways + microservices) layers all three:
+
+```
+your app
+  └── @nestjs/core
+       ├── @nestjs/common
+       ├── @nestjs/platform-express
+       ├── @nestjs/microservices
+       └── @nestjs/websockets
+            └── @nestjs/platform-socket.io | @nestjs/platform-ws
+```
+
+At bootstrap, `NestFactory.create(AppModule, adapter)` from `@nestjs/core` wires the module graph from `@nestjs/common` decorators, then hands request handling to the HTTP adapter you passed in. `app.connectMicroservice(...)` layers `@nestjs/microservices` onto the same DI container, and `useWebSocketAdapter(...)` layers a `@nestjs/platform-{socket.io,ws}` adapter onto `@nestjs/websockets`.
+
+Example — an Express-backed HTTP app with a WebSocket gateway:
+
+```ts
+import { NestFactory } from '@nestjs/core';
+import { ExpressAdapter } from '@nestjs/platform-express';
+import { IoAdapter } from '@nestjs/platform-socket.io';
+import { AppModule } from './app.module.js';
+
+const app = await NestFactory.create(AppModule, new ExpressAdapter());
+app.useWebSocketAdapter(new IoAdapter(app));
+await app.listen(3000);
+```
+
+Swapping to Fastify + `ws` is a two-import change; the module graph and everything under `@nestjs/common` / `@nestjs/core` stays the same.
+
+## Where to look when you edit these docs
+
+When documenting a public symbol, trace it back to the package that owns it:
+
+1. Find the package by its scope (`@nestjs/<name>`) and open `packages/<name>/`.
+2. Confirm the symbol is re-exported from `packages/<name>/index.ts`. If it is only in `packages/<name>/internal.ts`, mark the doc as internal.
+3. Cross-check the `dependencies` and `peerDependencies` blocks in `packages/<name>/package.json` before making claims about what a user needs to install alongside it.
+4. Ignore anything you find only under `integration/`, `sample/`, `tools/`, or a package's `test/` directory — those are not shipped.
